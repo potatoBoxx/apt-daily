@@ -43,3 +43,27 @@ def test_sqlite_upsert_and_parquet_export(tmp_path):
     assert res[0][0] == "인왕산아이파크"
     assert res[0][1] == 105000
     assert res[0][2] == "서울특별시"
+
+def test_ai_daily_summary_crud(tmp_path):
+    from src.storage import init_db, get_daily_summary, save_daily_summary
+    db_file = str(tmp_path / "test_summary.db")
+    init_db(db_file)
+
+    # 1. 초기 조회: None
+    assert get_daily_summary("2026-09-28", db_path=db_file) is None
+
+    # 2. 저장
+    stats = {"deal_count": 100, "avg_amount": 45000, "max_amount": 150000}
+    saved = save_daily_summary("2026-09-28", "### 분석 요약", stats, model_name="gemini-1.5-flash", db_path=db_file)
+    assert saved is True
+
+    # 3. 재조회: 저장된 데이터 반환
+    summary = get_daily_summary("2026-09-28", db_path=db_file)
+    assert summary is not None
+    assert summary["deal_date"] == "2026-09-28"
+    assert summary["summary_markdown"] == "### 분석 요약"
+    assert summary["deal_count"] == 100
+    assert summary["avg_amount"] == 45000
+    assert summary["max_amount"] == 150000
+    assert summary["model_name"] == "gemini-1.5-flash"
+

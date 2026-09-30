@@ -217,3 +217,117 @@ def get_sgg_options(parquet_path: str, sido: str = "전체") -> list[str]:
         rows = con.execute(query, [parquet_path]).fetchall()
 
     return [r[0] for r in rows if r[0]]
+
+def get_available_dates(parquet_path: str) -> list[str]:
+    """Parquet 파일에 존재하는 모든 거래 일자(deal_date)를 내림차순으로 반환합니다."""
+    if not Path(parquet_path).exists():
+        return []
+
+    con = duckdb.connect()
+    query = "SELECT DISTINCT deal_date FROM read_parquet(?) ORDER BY deal_date DESC"
+    rows = con.execute(query, [parquet_path]).fetchall()
+    return [r[0] for r in rows if r[0]]
+
+def get_daily_market_metrics(parquet_path: str, deal_date: str) -> dict:
+    """특정 일자의 핵심 마켓 메트릭(Gemini AI 프롬프트 생성용)을 집계하여 반환합니다."""
+    if not Path(parquet_path).exists():
+        return {
+            "deal_date": deal_date, "deal_count": 0, "avg_amount": 0,
+            "avg_pyeong_price": 0.0, "max_amount": 0, "top3_deals": [],
+            "capital_ratio": 0.0, "size_dist": {}
+        }
+
+    con = duckdb.connect()
+    # 1. 일자 기초 통계
+    query_stats = """
+    SELECT
+        COUNT(*) AS deal_count,
+        COALESCE(ROUND(AVG(deal_amount), 0), 0) AS avg_amount,
+        COALESCE(ROUND(AVG(price_per_pyeong), 1), 0.0) AS avg_pyeong_price,
+        COALESCE(MAX(deal_amount), 0) AS max_amount,
+        COALESCE(SUM(CASE WHEN sido_name IN ('서울특별시', '경기도', '인천광역시') THEN 1 ELSE 0 END), 0) AS capital_count
+    FROM read_parquet(?)
+    WHERE deal_date = ?
+    """
+    stats_row = con.execute(query_stats, [parquet_path, deal_date]).fetchone()
+    deal_count = int(stats_row[0]) if stats_row else 0
+    avg_amount = int(stats_row[1]) if stats_row else 0
+    avg_pyeong_price = float(stats_row[2]) if stats_row else 0.0
+    max_amount = int(stats_row[3]) if stats_row else 0
+    capital_count = int(stats_row[4]) if stats_row else 0
+    capital_ratio = round((capital_count / deal_count * 100), 1) if deal_count > 0 else 0.0
+
+    # 2. 최고가 거래 TOP 3
+    query_top3 = """
+    SELECT
+        apt_name, sido_name, sgg_name, umd_nm, pyeong, floor, deal_amount, price_per_pyeong
+    FROM read_parquet(?)
+    WHERE deal_date = ?
+    ORDER BY deal_amount DESC
+    LIMIT 3
+    """
+    top3_df = con.execute(query_top3, [parquet_path, deal_date]).df()
+    top3_deals = top3_df.to_dict(orient="records")
+
+    # 3. 평형대별 분포
+    query_size = """
+    SELECT
+        CASE
+            WHEN exclusive_area < 59.0 THEN '소형 (<59㎡)'
+            WHEN exclusive_area < 84.0 THEN '중소형 (59~84㎡)'
+            WHEN exclusive_area < 102.0 THEN '국민평형 (84~102㎡)'
+            ELSE '대형 (102㎡+)'
+        END AS size_group,
+        COUNT(*) AS count
+    FROM read_parquet(?)
+    WHERE deal_date = ?
+    GROUP BY size_group
+    """
+    size_df = con.execute(query_size, [parquet_path, deal_date]).df()
+    size_dist = dict(zip(size_df["size_group"], size_df["count"])) if not size_df.empty else {}
+
+    return {
+        "deal_date": deal_date,
+        "deal_count": deal_count,
+        "avg_amount": avg_amount,
+        "avg_pyeong_price": avg_pyeong_price,
+        "max_amount": max_amount,
+        "capital_count": capital_count,
+        "capital_ratio": capital_ratio,
+        "top3_deals": top3_deals,
+        "size_dist": size_dist
+    }
+
+def get_daily_deals_table(parquet_path: str, deal_date: str, sido: str = "전체") -> pd.DataFrame:
+    """특정 일자의 실거래 상세 테이블을 조회합니다."""
+    if not Path(parquet_path).exists():
+        return pd.DataFrame()
+
+    con = duckdb.connect()
+    conditions = ["deal_date = ?"]
+    params = [deal_date]
+
+    if sido and sido != "전체":
+        conditions.append("sido_name = ?")
+        params.append(sido)
+
+    where_sql = "WHERE " + " AND ".join(conditions)
+    query = f"""
+    SELECT
+        deal_date,
+        sido_name,
+        sgg_name,
+        umd_nm,
+        apt_name,
+        exclusive_area,
+        pyeong,
+        floor,
+        deal_amount,
+        price_per_pyeong,
+        build_year
+    FROM read_parquet(?)
+    {where_sql}
+    ORDER BY deal_amount DESC
+    """
+    return con.execute(query, [parquet_path] + params).df()
+

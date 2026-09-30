@@ -66,3 +66,21 @@ def test_get_top_deals(sample_parquet):
     assert len(df_top_deals) == 2
     assert df_top_deals.iloc[0]["apt_name"] == "현대1차"
     assert df_top_deals.iloc[0]["deal_amount"] == 420000
+
+def test_daily_query_functions(sample_parquet):
+    from src.dashboard.queries import get_available_dates, get_daily_market_metrics, get_daily_deals_table
+    dates = get_available_dates(sample_parquet)
+    assert dates == ["2026-09-28", "2026-09-27"]
+
+    metrics = get_daily_market_metrics(sample_parquet, "2026-09-28")
+    assert metrics["deal_count"] == 2
+    assert metrics["avg_amount"] == 340000
+    assert metrics["max_amount"] == 420000
+    assert "top3_deals" in metrics
+    assert len(metrics["top3_deals"]) == 2
+    assert metrics["top3_deals"][0]["apt_name"] == "현대1차"
+
+    table = get_daily_deals_table(sample_parquet, "2026-09-28")
+    assert len(table) == 2
+    assert (table["deal_date"] == "2026-09-28").all()
+

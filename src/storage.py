@@ -27,6 +27,15 @@ CREATE TABLE IF NOT EXISTS apt_trades (
 );
 CREATE INDEX IF NOT EXISTS idx_trades_date ON apt_trades(deal_date);
 CREATE INDEX IF NOT EXISTS idx_trades_sido ON apt_trades(sido_name, sgg_name);
+CREATE TABLE IF NOT EXISTS ai_daily_summaries (
+    deal_date TEXT PRIMARY KEY,
+    summary_markdown TEXT NOT NULL,
+    deal_count INTEGER NOT NULL,
+    avg_amount INTEGER NOT NULL,
+    max_amount INTEGER NOT NULL,
+    model_name TEXT DEFAULT 'gemini-1.5-flash',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
@@ -96,3 +105,45 @@ def export_to_parquet(db_path: str = DEFAULT_DB_PATH,
 
     df.to_parquet(parquet_path, index=False, compression="snappy")
     return len(df)
+
+def get_daily_summary(deal_date: str, db_path: str = DEFAULT_DB_PATH) -> dict | None:
+    """SQLite DB에서 특정 일자의 AI 분석 요약 레코드를 조회하여 반환합니다."""
+    if not Path(db_path).exists():
+        return None
+    init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT deal_date, summary_markdown, deal_count, avg_amount, max_amount, model_name, created_at
+            FROM ai_daily_summaries
+            WHERE deal_date = ?
+            """,
+            (deal_date,)
+        )
+        row = cursor.fetchone()
+        if row:
+            return dict(row)
+        return None
+
+def save_daily_summary(deal_date: str, summary_markdown: str, stats: dict,
+                       model_name: str = "gemini-1.5-flash",
+                       db_path: str = DEFAULT_DB_PATH) -> bool:
+    """Gemini가 생성한 특정 일자의 분석 요약을 SQLite DB에 영구 저장(UPSERT)합니다."""
+    init_db(db_path)
+    sql = """
+    INSERT OR REPLACE INTO ai_daily_summaries (
+        deal_date, summary_markdown, deal_count, avg_amount, max_amount, model_name, created_at
+    ) VALUES (
+        ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
+    )
+    """
+    deal_count = stats.get("deal_count", 0)
+    avg_amount = stats.get("avg_amount", 0)
+    max_amount = stats.get("max_amount", 0)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(sql, (deal_date, summary_markdown, deal_count, avg_amount, max_amount, model_name))
+        conn.commit()
+    return True
+
