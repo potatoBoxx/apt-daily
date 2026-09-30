@@ -1,0 +1,51 @@
+name: Daily Apartment Deals Collector
+
+on:
+  schedule:
+    # 매일 UTC 21:00 (한국 시간 오전 06:00 KST) 실행
+    - cron: '0 21 * * *'
+  workflow_dispatch: # GitHub 웹 UI에서 수동 실행 지원
+
+permissions:
+  contents: write
+
+jobs:
+  collect-and-update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: uv 설치 및 환경 세팅
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          version: "latest"
+
+      - name: Python 설치
+        run: uv python install 3.12
+
+      - name: 프로젝트 의존성 설치
+        run: uv sync
+
+      - name: 전국 아파트 실거래가 수집 실행
+        env:
+          MOLIT_API_KEY: ${{ secrets.MOLIT_API_KEY }}
+        run: |
+          uv run python -m src.collector --days 7
+
+      - name: 변경된 데이터 파일 Git Commit & Push
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/apt_deals.db data/latest_deals.parquet
+          
+          if git diff --staged --quiet; then
+            echo "새로 변경되거나 추가된 거래 데이터가 없습니다."
+          else
+            TODAY=$(date +'%Y-%m-%d')
+            git commit -m "chore(data): auto-update apt deals [${TODAY}]"
+            git push
+            echo "최신 데이터가 성공적으로 GitHub에 푸시되었습니다."
+          fi

@@ -1,0 +1,45 @@
+# 모든 숨김 폴더 제외 (.agents, .superpowers, .venv, .pytest_cache, .vscode, .idea 등)
+.*/
+# 단, GitHub Actions 워크플로우 폴더는 자동 수집 배포를 위해 필수 예외 허용
+!.github/
+!.github/**
+
+# 환경 변수 및 비밀 키 (절대 커밋 금지)
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# 기획 및 설계 문서 (사용자 요청)
+docs/
+
+# 로컬 원장 데이터베이스 (배포용 경량 data/latest_deals.parquet만 Git으로 관리)
+data/*.db
+data/*.db-journal
+data/*.sqlite
+data/*.sqlite3
+
+# 가상 환경 (uv 및 venv)
+venv/
+env/
+ENV/
+
+# Python 컴파일 및 캐시
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.coverage
+htmlcov/
+
+# 에디터 설정
+*.sublime-project
+*.sublime-workspace
+
+# OS 및 시스템 임시 파일
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+*.tmp
+*.temp
