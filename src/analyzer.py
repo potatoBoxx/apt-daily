@@ -97,12 +97,12 @@ def call_gemini_api(prompt: str, api_key: str | None = None, model: str = DEFAUL
             ],
             "generationConfig": {
                 "temperature": 0.3,
-                "maxOutputTokens": 2048
+                "maxOutputTokens": 4096
             }
         }
 
         try:
-            with httpx.Client(timeout=35.0) as client:
+            with httpx.Client(timeout=45.0) as client:
                 resp = client.post(url, params=params, json=payload)
                 if resp.status_code == 200:
                     data = resp.json()

@@ -115,7 +115,13 @@ st.markdown("---")
 # 4. 🤖 AI 부동산 애널리스트 리포트 섹션
 gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
 
-st.subheader("🤖 부동산 전문 수석 애널리스트 마켓 리포트")
+col_rep_title, col_rep_btn = st.columns([3, 1])
+with col_rep_title:
+    st.subheader("🤖 부동산 전문 수석 애널리스트 마켓 리포트")
+with col_rep_btn:
+    main_refresh = st.button("🔄 AI 분석 다시 생성하기", key="main_refresh_btn", help="기존 저장된 내용을 지우고 Gemini API로 전체 리포트를 처음부터 다시 작성합니다.", use_container_width=True)
+
+should_refresh = force_refresh or main_refresh
 
 if not gemini_key:
     st.warning("⚠️ `.env` 파일에 `GEMINI_API_KEY`가 설정되어 있지 않습니다. 키를 등록하시면 인공지능 애널리스트의 날카로운 일일 분석 리포트가 자동으로 생성됩니다.")
@@ -126,20 +132,20 @@ if not gemini_key:
     ```
     """)
 else:
-    with st.spinner("AI 부동산 애널리스트가 당일 시장 데이터를 분석 중입니다..."):
+    with st.spinner("AI 부동산 애널리스트가 당일 시장 데이터를 심층 분석 중입니다..."):
         analysis_data, is_cached = get_or_create_daily_analysis(
             deal_date=selected_date,
             parquet_path=parquet_path,
             db_path=db_path,
             api_key=gemini_key,
-            force_refresh=force_refresh
+            force_refresh=should_refresh
         )
 
     # 뱃지 및 생성 정보 표시
     badge_html = (
         '<span class="badge-cache">💾 SQLite DB 캐시에서 불러옴 (API 호출 0회)</span>'
         if is_cached else
-        '<span class="badge-fresh">✨ Gemini 1.5 Flash 신규 생성 완료 (DB 영구 저장됨)</span>'
+        '<span class="badge-fresh">✨ Gemini 3.5 Flash 신규 생성 완료 (DB 영구 저장됨)</span>'
     )
     created_at = analysis_data.get("created_at", "")
     info_text = f"분석 일시: {created_at}" if created_at else ""
