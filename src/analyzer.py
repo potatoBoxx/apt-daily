@@ -128,6 +128,13 @@ def call_gemini_api(prompt: str, api_key: str | None = None, model: str = DEFAUL
 
     return f"⚠️ Gemini AI 분석 생성 중 오류가 발생했습니다: {last_error}"
 
+def is_error_summary(text: str) -> bool:
+    """분석 결과 텍스트가 오류 메시지인지 판별합니다."""
+    if not text:
+        return True
+    error_keywords = ["⚠️", "오류가 발생했습니다", "Client error", "Not Found", "404", "503", "UNAVAILABLE"]
+    return any(kw in text for kw in error_keywords)
+
 def get_or_create_daily_analysis(
     deal_date: str,
     parquet_path: str,
@@ -138,14 +145,17 @@ def get_or_create_daily_analysis(
 ) -> tuple[dict, bool]:
     """
     특정 일자의 AI 분석 요약을 조회하거나 신규 생성합니다.
-    - 캐시 히트 (기존 요약 존재 & force_refresh=False): SQLite에서 즉시 로드 (is_cached=True)
-    - 캐시 미스 (미존재 또는 force_refresh=True): Gemini API 호출 후 SQLite에 저장 (is_cached=False)
+    - 캐시 히트 (정상 요약 존재 & force_refresh=False): SQLite에서 즉시 로드 (is_cached=True)
+    - 캐시 미스 (미존재, force_refresh=True, 또는 기존 캐시가 오류인 경우): Gemini API 호출 (is_cached=False)
     """
-    # 1. 캐시 확인
+    # 1. 캐시 확인 (오류가 아닌 유효한 분석 리포트만 캐시 히트로 인정)
     if not force_refresh:
         cached = get_daily_summary(deal_date, db_path=db_path)
         if cached:
-            return cached, True
+            summary_text = cached.get("summary_markdown", "")
+            if not is_error_summary(summary_text):
+                return cached, True
+            logger.info(f"[{deal_date}] 캐시된 요약에 오류 내용이 감지되어 자동으로 재분석을 수행합니다.")
 
     # 2. 통계 데이터 추출
     metrics = get_daily_market_metrics(parquet_path, deal_date)
@@ -168,25 +178,33 @@ def get_or_create_daily_analysis(
         logger.error(f"Gemini API 호출 중 오류 발생: {e}")
         summary_text = f"⚠️ Gemini AI 분석 생성 중 오류가 발생했습니다: {str(e)}"
 
-    # 4. SQLite 영구 저장
     stats = {
         "deal_count": metrics["deal_count"],
         "avg_amount": metrics["avg_amount"],
         "max_amount": metrics["max_amount"]
     }
-    save_daily_summary(
-        deal_date=deal_date,
-        summary_markdown=summary_text,
-        stats=stats,
-        model_name=model,
-        db_path=db_path
-    )
 
-    # 5. 저장된 결과 반환
-    result = get_daily_summary(deal_date, db_path=db_path) or {
-        "deal_date": deal_date,
-        "summary_markdown": summary_text,
-        **stats,
-        "model_name": model
-    }
-    return result, False
+    # 4. 유효한 분석 결과일 때만 SQLite 영구 저장 (오류는 저장하지 않고 화면에만 반환)
+    if not is_error_summary(summary_text):
+        save_daily_summary(
+            deal_date=deal_date,
+            summary_markdown=summary_text,
+            stats=stats,
+            model_name=model,
+            db_path=db_path
+        )
+        return get_daily_summary(deal_date, db_path=db_path) or {
+            "deal_date": deal_date,
+            "summary_markdown": summary_text,
+            **stats,
+            "model_name": model
+        }, False
+    else:
+        # 오류 발생 시에는 DB에 저장하지 않아 다음 호출 시 재시도 가능
+        return {
+            "deal_date": deal_date,
+            "summary_markdown": summary_text,
+            **stats,
+            "model_name": model
+        }, False
+

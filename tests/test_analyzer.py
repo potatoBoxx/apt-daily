@@ -109,3 +109,51 @@ def test_force_refresh_updates_db(test_env):
         assert mock_gemini.call_count == 1
         assert is_cached is False
         assert res["summary_markdown"] == "### 새로고침된 신규 요약"
+
+def test_error_cache_is_auto_invalidated_and_regenerated(test_env):
+    from src.analyzer import get_or_create_daily_analysis
+
+    # 1. DB에 이전 오류 메시지가 저장되어 있는 상태
+    save_daily_summary(
+        "2026-09-28",
+        "⚠️ Gemini AI 분석 생성 중 오류가 발생했습니다: 404 Not Found",
+        {"deal_count": 1, "avg_amount": 450000, "max_amount": 450000},
+        model_name="gemini-1.5-flash",
+        db_path=test_env["db"]
+    )
+
+    # 2. 조회 시 오류 캐시를 무시하고 자동으로 재분석(API 호출)을 수행해야 함
+    with patch("src.analyzer.call_gemini_api", return_value="### 정상 복구된 신규 분석 리포트") as mock_gemini:
+        res, is_cached = get_or_create_daily_analysis(
+            deal_date="2026-09-28",
+            parquet_path=test_env["parquet"],
+            db_path=test_env["db"],
+            api_key="test_dummy_key"
+        )
+        assert mock_gemini.call_count == 1
+        assert is_cached is False
+        assert res["summary_markdown"] == "### 정상 복구된 신규 분석 리포트"
+
+    # 3. DB에도 정상 분석 결과로 갱신되었는지 확인
+    saved = get_daily_summary("2026-09-28", db_path=test_env["db"])
+    assert saved is not None
+    assert saved["summary_markdown"] == "### 정상 복구된 신규 분석 리포트"
+
+def test_failed_call_is_not_saved_to_db(test_env):
+    from src.analyzer import get_or_create_daily_analysis
+
+    # 1. API 호출이 오류 메시지를 반환할 때
+    with patch("src.analyzer.call_gemini_api", return_value="⚠️ Gemini AI 분석 생성 중 오류가 발생했습니다: 503") as mock_gemini:
+        res, is_cached = get_or_create_daily_analysis(
+            deal_date="2026-09-28",
+            parquet_path=test_env["parquet"],
+            db_path=test_env["db"],
+            api_key="test_dummy_key"
+        )
+        assert mock_gemini.call_count == 1
+        assert res["summary_markdown"].startswith("⚠️")
+
+    # 2. 오류 메시지는 DB에 영구 저장되지 않아야 함
+    saved = get_daily_summary("2026-09-28", db_path=test_env["db"])
+    assert saved is None
+
