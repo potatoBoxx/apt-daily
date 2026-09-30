@@ -5,8 +5,12 @@ import httpx
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-from src.storage import get_daily_summary, save_daily_summary, DEFAULT_DB_PATH
-from src.dashboard.queries import get_daily_market_metrics
+from src.storage import (
+    get_daily_summary, save_daily_summary, export_ai_summaries_to_json,
+    sync_ai_summaries_from_json, DEFAULT_DB_PATH, DEFAULT_PARQUET_PATH,
+    DEFAULT_AI_SUMMARIES_JSON_PATH
+)
+from src.dashboard.queries import get_daily_market_metrics, get_available_dates
 
 load_dotenv()
 logger = logging.getLogger("analyzer")
@@ -141,21 +145,37 @@ def get_or_create_daily_analysis(
     db_path: str = DEFAULT_DB_PATH,
     api_key: str | None = None,
     force_refresh: bool = False,
-    model: str = DEFAULT_GEMINI_MODEL
+    model: str = DEFAULT_GEMINI_MODEL,
+    json_path: str | None = DEFAULT_AI_SUMMARIES_JSON_PATH
 ) -> tuple[dict, bool]:
     """
     특정 일자의 AI 분석 요약을 조회하거나 신규 생성합니다.
     - 캐시 히트 (정상 요약 존재 & force_refresh=False): SQLite에서 즉시 로드 (is_cached=True)
-    - 캐시 미스 (미존재, force_refresh=True, 또는 기존 캐시가 오류인 경우): Gemini API 호출 (is_cached=False)
+    - 강제 재분석 (force_refresh=True): 일자별 최대 1회만 허용 (refresh_count < 1)
+      이미 1회 재분석이 완료된 경우(refresh_count >= 1)에는 API 호출 없이 기존 캐시 반환
     """
-    # 1. 캐시 확인 (오류가 아닌 유효한 분석 리포트만 캐시 히트로 인정)
-    if not force_refresh:
+    # 1. 캐시 확인 및 JSON 복원 지원 (기본 DB이거나 명시적 커스텀 JSON 경로인 경우에만 동기화)
+    cached = get_daily_summary(deal_date, db_path=db_path)
+    should_sync_json = json_path and (db_path == DEFAULT_DB_PATH or json_path != DEFAULT_AI_SUMMARIES_JSON_PATH)
+    if not cached and should_sync_json:
+        sync_ai_summaries_from_json(json_path=json_path, db_path=db_path)
         cached = get_daily_summary(deal_date, db_path=db_path)
-        if cached:
-            summary_text = cached.get("summary_markdown", "")
-            if not is_error_summary(summary_text):
-                return cached, True
-            logger.info(f"[{deal_date}] 캐시된 요약에 오류 내용이 감지되어 자동으로 재분석을 수행합니다.")
+
+    has_valid_cache = cached is not None and not is_error_summary(cached.get("summary_markdown", ""))
+    refresh_count = cached.get("refresh_count", 0) if cached else 0
+
+    if not force_refresh:
+        if has_valid_cache:
+            cached["can_refresh"] = (refresh_count < 1)
+            cached["refresh_count"] = refresh_count
+            return cached, True
+    else:
+        # force_refresh=True인 경우 일자별 1회 제한 검사
+        if has_valid_cache and refresh_count >= 1:
+            logger.info(f"[{deal_date}] 해당 일자는 이미 1회 재분석이 완료되어 추가 재생성이 차단됩니다.")
+            cached["can_refresh"] = False
+            cached["refresh_count"] = refresh_count
+            return cached, True
 
     # 2. 통계 데이터 추출
     metrics = get_daily_market_metrics(parquet_path, deal_date)
@@ -166,7 +186,9 @@ def get_or_create_daily_analysis(
             "deal_count": 0,
             "avg_amount": 0,
             "max_amount": 0,
-            "model_name": model
+            "model_name": model,
+            "refresh_count": refresh_count,
+            "can_refresh": False
         }
         return empty_res, False
 
@@ -184,27 +206,108 @@ def get_or_create_daily_analysis(
         "max_amount": metrics["max_amount"]
     }
 
-    # 4. 유효한 분석 결과일 때만 SQLite 영구 저장 (오류는 저장하지 않고 화면에만 반환)
+    # 4. 유효한 분석 결과일 때만 SQLite 영구 저장
     if not is_error_summary(summary_text):
+        new_refresh_count = (refresh_count + 1) if (force_refresh and has_valid_cache) else refresh_count
         save_daily_summary(
             deal_date=deal_date,
             summary_markdown=summary_text,
             stats=stats,
             model_name=model,
-            db_path=db_path
+            db_path=db_path,
+            refresh_count=new_refresh_count
         )
-        return get_daily_summary(deal_date, db_path=db_path) or {
+        if should_sync_json:
+            export_ai_summaries_to_json(db_path=db_path, json_path=json_path)
+
+        saved = get_daily_summary(deal_date, db_path=db_path) or {
             "deal_date": deal_date,
             "summary_markdown": summary_text,
             **stats,
-            "model_name": model
-        }, False
+            "model_name": model,
+            "refresh_count": new_refresh_count
+        }
+        saved["can_refresh"] = (saved.get("refresh_count", 0) < 1)
+        return saved, False
     else:
         # 오류 발생 시에는 DB에 저장하지 않아 다음 호출 시 재시도 가능
         return {
             "deal_date": deal_date,
             "summary_markdown": summary_text,
             **stats,
-            "model_name": model
+            "model_name": model,
+            "refresh_count": refresh_count,
+            "can_refresh": True
         }, False
+
+def generate_auto_daily_report(
+    parquet_path: str = DEFAULT_PARQUET_PATH,
+    db_path: str = DEFAULT_DB_PATH,
+    json_path: str = DEFAULT_AI_SUMMARIES_JSON_PATH,
+    api_key: str | None = None
+) -> dict:
+    """
+    매일 아침 배치용: 최신 거래일자를 감지하여 AI 마켓 리포트를 자동 생성하고 저장합니다.
+    이미 해당 일자의 정상 리포트가 존재하면 생성을 스킵합니다.
+    """
+    dates = get_available_dates(parquet_path)
+    if not dates:
+        logger.warning("자동 리포트 생성 실패: Parquet 데이터가 비어 있습니다.")
+        return {"status": "no_data"}
+
+    latest_date = dates[0]
+    cached = get_daily_summary(latest_date, db_path=db_path)
+    if not cached and json_path:
+        sync_ai_summaries_from_json(json_path=json_path, db_path=db_path)
+        cached = get_daily_summary(latest_date, db_path=db_path)
+
+    if cached and not is_error_summary(cached.get("summary_markdown", "")):
+        logger.info(f"[{latest_date}] AI 마켓 리포트가 이미 존재합니다. 생성을 스킵합니다.")
+        if json_path:
+            export_ai_summaries_to_json(db_path=db_path, json_path=json_path)
+        return {"status": "skipped", "deal_date": latest_date, "summary": cached}
+
+    logger.info(f"[{latest_date}] 최신 일자 AI 마켓 리포트 자동 생성 시작...")
+    analysis_data, is_cached = get_or_create_daily_analysis(
+        deal_date=latest_date,
+        parquet_path=parquet_path,
+        db_path=db_path,
+        api_key=api_key,
+        force_refresh=True,
+        json_path=json_path
+    )
+
+    if is_error_summary(analysis_data.get("summary_markdown", "")):
+        logger.error(f"[{latest_date}] AI 리포트 자동 생성 실패: {analysis_data.get('summary_markdown')}")
+        return {"status": "error", "deal_date": latest_date, "error": analysis_data.get("summary_markdown")}
+
+    logger.info(f"[{latest_date}] AI 마켓 리포트 자동 생성 및 영구 저장 완료!")
+    return {"status": "created", "deal_date": latest_date, "summary": analysis_data}
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Gemini AI 부동산 애널리스트 CLI")
+    parser.add_argument("--auto-daily", action="store_true", help="최신 거래일자 AI 마켓 리포트 자동 생성")
+    parser.add_argument("--date", type=str, help="특정 일자(YYYY-MM-DD) 리포트 생성")
+    parser.add_argument("--parquet", type=str, default=DEFAULT_PARQUET_PATH, help="Parquet 파일 경로")
+    parser.add_argument("--db", type=str, default=DEFAULT_DB_PATH, help="SQLite DB 파일 경로")
+    parser.add_argument("--json", type=str, default=DEFAULT_AI_SUMMARIES_JSON_PATH, help="AI 리포트 JSON 백업 경로")
+    args = parser.parse_args()
+
+    if args.auto_daily:
+        res = generate_auto_daily_report(
+            parquet_path=args.parquet,
+            db_path=args.db,
+            json_path=args.json
+        )
+        print(f"자동 리포트 결과: {res.get('status')} (일자: {res.get('deal_date')})")
+    elif args.date:
+        res, is_cached = get_or_create_daily_analysis(
+            deal_date=args.date,
+            parquet_path=args.parquet,
+            db_path=args.db,
+            force_refresh=True,
+            json_path=args.json
+        )
+        print(f"리포트 생성 결과 (캐시여부: {is_cached}):\n{res.get('summary_markdown', '')[:200]}...")
 

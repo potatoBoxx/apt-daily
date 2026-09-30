@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 from datetime import datetime, timedelta
@@ -6,6 +7,7 @@ import pandas as pd
 
 DEFAULT_DB_PATH = "data/apt_deals.db"
 DEFAULT_PARQUET_PATH = "data/latest_deals.parquet"
+DEFAULT_AI_SUMMARIES_JSON_PATH = "data/ai_daily_summaries.json"
 
 DDL_CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS apt_trades (
@@ -34,16 +36,21 @@ CREATE TABLE IF NOT EXISTS ai_daily_summaries (
     avg_amount INTEGER NOT NULL,
     max_amount INTEGER NOT NULL,
     model_name TEXT DEFAULT 'gemini-1.5-flash',
+    refresh_count INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
 
 def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
-    """SQLite 데이터베이스 및 테이블 초기화"""
+    """SQLite 데이터베이스 및 테이블 초기화 및 스키마 마이그레이션"""
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(db_path) as conn:
         conn.executescript(DDL_CREATE_TABLE)
+        try:
+            conn.execute("ALTER TABLE ai_daily_summaries ADD COLUMN refresh_count INTEGER DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
 
 def save_to_sqlite(items: list[dict], db_path: str = DEFAULT_DB_PATH) -> int:
@@ -116,7 +123,7 @@ def get_daily_summary(deal_date: str, db_path: str = DEFAULT_DB_PATH) -> dict | 
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT deal_date, summary_markdown, deal_count, avg_amount, max_amount, model_name, created_at
+            SELECT deal_date, summary_markdown, deal_count, avg_amount, max_amount, model_name, refresh_count, created_at
             FROM ai_daily_summaries
             WHERE deal_date = ?
             """,
@@ -124,26 +131,98 @@ def get_daily_summary(deal_date: str, db_path: str = DEFAULT_DB_PATH) -> dict | 
         )
         row = cursor.fetchone()
         if row:
-            return dict(row)
+            data = dict(row)
+            if "refresh_count" not in data or data["refresh_count"] is None:
+                data["refresh_count"] = 0
+            return data
         return None
 
 def save_daily_summary(deal_date: str, summary_markdown: str, stats: dict,
                        model_name: str = "gemini-1.5-flash",
-                       db_path: str = DEFAULT_DB_PATH) -> bool:
+                       db_path: str = DEFAULT_DB_PATH,
+                       refresh_count: int | None = None) -> bool:
     """Gemini가 생성한 특정 일자의 분석 요약을 SQLite DB에 영구 저장(UPSERT)합니다."""
     init_db(db_path)
+    if refresh_count is None:
+        existing = get_daily_summary(deal_date, db_path)
+        refresh_count = existing["refresh_count"] if existing and "refresh_count" in existing else 0
+
     sql = """
     INSERT OR REPLACE INTO ai_daily_summaries (
-        deal_date, summary_markdown, deal_count, avg_amount, max_amount, model_name, created_at
+        deal_date, summary_markdown, deal_count, avg_amount, max_amount, model_name, refresh_count, created_at
     ) VALUES (
-        ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
+        ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP
     )
     """
     deal_count = stats.get("deal_count", 0)
     avg_amount = stats.get("avg_amount", 0)
     max_amount = stats.get("max_amount", 0)
     with sqlite3.connect(db_path) as conn:
-        conn.execute(sql, (deal_date, summary_markdown, deal_count, avg_amount, max_amount, model_name))
+        conn.execute(sql, (deal_date, summary_markdown, deal_count, avg_amount, max_amount, model_name, refresh_count))
         conn.commit()
     return True
+
+def export_ai_summaries_to_json(db_path: str = DEFAULT_DB_PATH,
+                                json_path: str = DEFAULT_AI_SUMMARIES_JSON_PATH) -> int:
+    """SQLite의 모든 AI 일일 요약 데이터를 JSON 파일로 내보냅니다."""
+    if not Path(db_path).exists():
+        return 0
+    init_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT deal_date, summary_markdown, deal_count, avg_amount, max_amount, model_name, refresh_count, created_at
+            FROM ai_daily_summaries
+            ORDER BY deal_date DESC
+            """
+        )
+        rows = cursor.fetchall()
+
+    data = {}
+    for row in rows:
+        d = dict(row)
+        if "created_at" in d and isinstance(d["created_at"], datetime):
+            d["created_at"] = d["created_at"].isoformat()
+        deal_date = d["deal_date"]
+        data[deal_date] = d
+
+    out_file = Path(json_path)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    return len(data)
+
+def sync_ai_summaries_from_json(json_path: str = DEFAULT_AI_SUMMARIES_JSON_PATH,
+                                db_path: str = DEFAULT_DB_PATH) -> int:
+    """JSON 파일의 요약 데이터를 SQLite DB로 복원/동기화합니다."""
+    path = Path(json_path)
+    if not path.exists():
+        return 0
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    synced = 0
+    for deal_date, item in data.items():
+        existing = get_daily_summary(deal_date, db_path)
+        if not existing:
+            stats = {
+                "deal_count": item.get("deal_count", 0),
+                "avg_amount": item.get("avg_amount", 0),
+                "max_amount": item.get("max_amount", 0),
+            }
+            save_daily_summary(
+                deal_date=deal_date,
+                summary_markdown=item.get("summary_markdown", ""),
+                stats=stats,
+                model_name=item.get("model_name", "gemini-1.5-flash"),
+                db_path=db_path,
+                refresh_count=item.get("refresh_count", 0)
+            )
+            synced += 1
+
+    return synced
 

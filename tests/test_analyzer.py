@@ -1,4 +1,5 @@
 from unittest.mock import patch
+from pathlib import Path
 import pytest
 import pandas as pd
 
@@ -156,4 +157,78 @@ def test_failed_call_is_not_saved_to_db(test_env):
     # 2. 오류 메시지는 DB에 영구 저장되지 않아야 함
     saved = get_daily_summary("2026-09-28", db_path=test_env["db"])
     assert saved is None
+
+def test_single_regeneration_limit(test_env):
+    """일자별 AI 재분석은 최대 1회만 허용되고, 2회째 시도 시 API를 호출하지 않고 차단되는지 검증"""
+    from src.analyzer import get_or_create_daily_analysis
+
+    # 1. 초기 1회 생성 (refresh_count = 0)
+    with patch("src.analyzer.call_gemini_api", return_value="### 최초 생성 리포트") as mock_gemini:
+        res1, is_cached1 = get_or_create_daily_analysis(
+            deal_date="2026-09-28",
+            parquet_path=test_env["parquet"],
+            db_path=test_env["db"],
+            api_key="test_key"
+        )
+        assert mock_gemini.call_count == 1
+        assert res1["refresh_count"] == 0
+        assert res1["can_refresh"] is True
+
+    # 2. 1회차 강제 재분석 (force_refresh=True) 허용 -> refresh_count가 1로 증가
+    with patch("src.analyzer.call_gemini_api", return_value="### 1회차 재분석 완료") as mock_gemini:
+        res2, is_cached2 = get_or_create_daily_analysis(
+            deal_date="2026-09-28",
+            parquet_path=test_env["parquet"],
+            db_path=test_env["db"],
+            api_key="test_key",
+            force_refresh=True
+        )
+        assert mock_gemini.call_count == 1
+        assert res2["summary_markdown"] == "### 1회차 재분석 완료"
+        assert res2["refresh_count"] == 1
+        assert res2["can_refresh"] is False
+
+    # 3. 2회차 강제 재분석 시도 (force_refresh=True) -> 제한에 걸려 API 호출 차단되어야 함
+    with patch("src.analyzer.call_gemini_api") as mock_gemini:
+        res3, is_cached3 = get_or_create_daily_analysis(
+            deal_date="2026-09-28",
+            parquet_path=test_env["parquet"],
+            db_path=test_env["db"],
+            api_key="test_key",
+            force_refresh=True
+        )
+        # API 호출이 없어야 함
+        assert mock_gemini.call_count == 0
+        # 기존 1회차 재분석 결과 유지
+        assert res3["summary_markdown"] == "### 1회차 재분석 완료"
+        assert res3["refresh_count"] == 1
+        assert res3["can_refresh"] is False
+
+def test_generate_auto_daily_report(test_env, tmp_path):
+    """매일 아침 배치용 최신 일자 리포트 자동 생성 검증"""
+    from src.analyzer import generate_auto_daily_report
+
+    json_file = str(tmp_path / "auto_summaries.json")
+    with patch("src.analyzer.call_gemini_api", return_value="### 아침 자동 생성 리포트") as mock_gemini:
+        result = generate_auto_daily_report(
+            parquet_path=test_env["parquet"],
+            db_path=test_env["db"],
+            json_path=json_file,
+            api_key="test_key"
+        )
+        assert result["status"] == "created"
+        assert result["deal_date"] == "2026-09-28"
+        assert mock_gemini.call_count == 1
+        assert Path(json_file).exists()
+
+    # 이미 존재하는 경우 재실행 시 스킵(skipped) 검증
+    with patch("src.analyzer.call_gemini_api") as mock_gemini:
+        result2 = generate_auto_daily_report(
+            parquet_path=test_env["parquet"],
+            db_path=test_env["db"],
+            json_path=json_file,
+            api_key="test_key"
+        )
+        assert result2["status"] == "skipped"
+        assert mock_gemini.call_count == 0
 

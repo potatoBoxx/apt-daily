@@ -4,13 +4,13 @@ import streamlit as st
 import pandas as pd
 from dotenv import load_dotenv
 
-from src.storage import DEFAULT_DB_PATH, DEFAULT_PARQUET_PATH
+from src.storage import DEFAULT_DB_PATH, DEFAULT_PARQUET_PATH, get_daily_summary
 from src.dashboard.queries import (
     get_available_dates,
     get_daily_market_metrics,
     get_daily_deals_table
 )
-from src.analyzer import get_or_create_daily_analysis
+from src.analyzer import get_or_create_daily_analysis, is_error_summary
 
 load_dotenv()
 
@@ -82,13 +82,24 @@ selected_date = st.sidebar.selectbox("조회 일자", options=available_dates, i
 sido_options = ["전체", "서울특별시", "경기도", "인천광역시", "부산광역시", "대구광역시", "광주광역시", "대전광역시", "울산광역시", "세종특별자치시", "강원특별자치도", "충청북도", "충청남도", "전북특별자치도", "전라남도", "경상북도", "경상남도", "제주특별자치도"]
 selected_sido = st.sidebar.selectbox("지역(시·도) 필터", options=sido_options, index=0)
 
-force_refresh = st.sidebar.button("🔄 AI 분석 새로고침", help="이미 저장된 캐시를 무시하고 Gemini API를 다시 호출하여 새로운 분석을 생성합니다.")
+# 해당 일자의 기존 AI 요약 상태 확인
+existing_cached = get_daily_summary(selected_date, db_path=db_path)
+has_valid_cached = existing_cached is not None and not is_error_summary(existing_cached.get("summary_markdown", ""))
+refresh_count = existing_cached.get("refresh_count", 0) if existing_cached else 0
+can_refresh = (not has_valid_cached) or (refresh_count < 1)
+
+if can_refresh:
+    force_refresh = st.sidebar.button("🔄 AI 분석 새로고침", help="기존 리포트를 덮어쓰고 최신 Gemini 모델로 다시 분석합니다. (일자별 최대 1회 가능)")
+else:
+    st.sidebar.button("🔒 재분석 완료 (1회 제한)", disabled=True, help="해당 일자의 AI 분석은 이미 1회 재작성되어 추가 재생성이 제한됩니다.")
+    force_refresh = False
 
 st.sidebar.markdown("---")
 st.sidebar.info("""
 **💡 AI 마켓 브리핑 안내**
-- 최초 1회 생성된 애널리스트 리포트는 **SQLite DB**에 영구 저장됩니다.
-- 동일한 날짜를 다시 조회할 때는 API 재호출 없이 **저장된 리포트**를 즉시 불러옵니다.
+- 매일 아침 Gemini가 작성한 분석 리포트가 자동 저장됩니다.
+- 이미 저장된 날짜는 API 재호출 없이 즉시 로드됩니다.
+- AI 분석 다시 생성은 **일자별 최대 1회**로 제한됩니다.
 """)
 
 # 3. 메인 콘텐츠
@@ -119,9 +130,16 @@ col_rep_title, col_rep_btn = st.columns([3, 1])
 with col_rep_title:
     st.subheader("🤖 부동산 전문 수석 애널리스트 마켓 리포트")
 with col_rep_btn:
-    main_refresh = st.button("🔄 AI 분석 다시 생성하기", key="main_refresh_btn", help="기존 저장된 내용을 지우고 Gemini API로 전체 리포트를 처음부터 다시 작성합니다.", use_container_width=True)
+    if can_refresh:
+        main_refresh = st.button("🔄 AI 분석 다시 생성하기", key="main_refresh_btn", help="기존 저장된 내용을 지우고 Gemini API로 전체 리포트를 처음부터 다시 작성합니다. (일자별 최대 1회 가능)", use_container_width=True)
+    else:
+        st.button("🔒 재분석 완료 (1회 제한)", key="main_refresh_btn", disabled=True, help="해당 일자의 AI 분석은 이미 1회 재작성되어 추가 재생성이 제한됩니다.", use_container_width=True)
+        main_refresh = False
 
-should_refresh = force_refresh or main_refresh
+if not can_refresh:
+    st.caption("ℹ️ 해당 일자의 AI 분석 재작성은 1회로 제한되어 있으며, 이미 재작성이 완료되었습니다.")
+
+should_refresh = (force_refresh or main_refresh) and can_refresh
 
 if not gemini_key:
     st.warning("⚠️ `.env` 파일에 `GEMINI_API_KEY`가 설정되어 있지 않습니다. 키를 등록하시면 인공지능 애널리스트의 날카로운 일일 분석 리포트가 자동으로 생성됩니다.")
@@ -142,11 +160,13 @@ else:
         )
 
     # 뱃지 및 생성 정보 표시
-    badge_html = (
-        '<span class="badge-cache">💾 SQLite DB 캐시에서 불러옴 (API 호출 0회)</span>'
-        if is_cached else
-        '<span class="badge-fresh">✨ Gemini 3.5 Flash 신규 생성 완료 (DB 영구 저장됨)</span>'
-    )
+    badge_label = "💾 SQLite DB 캐시에서 불러옴 (API 호출 0회)"
+    if not is_cached:
+        badge_label = "✨ Gemini 3.5 Flash 신규 생성 완료 (DB 영구 저장됨)"
+    elif analysis_data.get("refresh_count", 0) >= 1:
+        badge_label = "💾 SQLite DB 캐시 (재작성 1회 완료)"
+
+    badge_html = f'<span class="badge-cache">{badge_label}</span>' if is_cached else f'<span class="badge-fresh">{badge_label}</span>'
     created_at = analysis_data.get("created_at", "")
     info_text = f"분석 일시: {created_at}" if created_at else ""
 

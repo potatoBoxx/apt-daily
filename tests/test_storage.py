@@ -66,4 +66,47 @@ def test_ai_daily_summary_crud(tmp_path):
     assert summary["avg_amount"] == 45000
     assert summary["max_amount"] == 150000
     assert summary["model_name"] == "gemini-1.5-flash"
+    assert summary["refresh_count"] == 0
+
+def test_refresh_count_and_json_sync(tmp_path):
+    import json
+    from src.storage import init_db, get_daily_summary, save_daily_summary, export_ai_summaries_to_json, sync_ai_summaries_from_json
+
+    db_file = str(tmp_path / "test_sync.db")
+    json_file = str(tmp_path / "test_summaries.json")
+    init_db(db_file)
+
+    # 1. 초기 저장 (refresh_count = 0)
+    stats = {"deal_count": 50, "avg_amount": 40000, "max_amount": 100000}
+    save_daily_summary("2026-09-28", "### 첫 리포트", stats, db_path=db_file, refresh_count=0)
+    
+    row = get_daily_summary("2026-09-28", db_path=db_file)
+    assert row["refresh_count"] == 0
+
+    # 2. 1회 재분석 저장 (refresh_count = 1)
+    save_daily_summary("2026-09-28", "### 재생성 리포트", stats, db_path=db_file, refresh_count=1)
+    row_updated = get_daily_summary("2026-09-28", db_path=db_file)
+    assert row_updated["refresh_count"] == 1
+    assert row_updated["summary_markdown"] == "### 재생성 리포트"
+
+    # 3. JSON으로 내보내기 검증
+    export_count = export_ai_summaries_to_json(db_file, json_file)
+    assert export_count == 1
+    assert Path(json_file).exists()
+
+    with open(json_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert "2026-09-28" in data
+    assert data["2026-09-28"]["refresh_count"] == 1
+
+    # 4. 빈 DB에 JSON으로부터 복원 검증
+    new_db_file = str(tmp_path / "restored.db")
+    init_db(new_db_file)
+    synced_count = sync_ai_summaries_from_json(json_file, new_db_file)
+    assert synced_count == 1
+
+    restored_row = get_daily_summary("2026-09-28", db_path=new_db_file)
+    assert restored_row is not None
+    assert restored_row["summary_markdown"] == "### 재생성 리포트"
+    assert restored_row["refresh_count"] == 1
 

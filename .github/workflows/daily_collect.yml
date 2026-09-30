@@ -43,17 +43,28 @@ jobs:
         run: |
           uv run python -m src.collector --days 7
 
-      - name: 최신 Parquet 데이터 Git Commit & Push
+      - name: 당일 AI 부동산 마켓 리포트 자동 생성 및 저장
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -n "$GEMINI_API_KEY" ]; then
+            echo "GEMINI_API_KEY 감지됨: 최신 일자 AI 애널리스트 리포트 자동 생성 실행..."
+            uv run python -m src.analyzer --auto-daily
+          else
+            echo "::warning::GitHub Secrets에 GEMINI_API_KEY가 설정되지 않아 당일 AI 리포트 자동 생성을 건너뜁니다."
+          fi
+
+      - name: 최신 데이터 및 AI 리포트 Git Commit & Push
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/latest_deals.parquet
+          git add data/latest_deals.parquet data/ai_daily_summaries.json
           
           if git diff --staged --quiet; then
-            echo "새로 변경되거나 추가된 거래 데이터가 없습니다."
+            echo "새로 변경되거나 추가된 거래 데이터 및 AI 리포트가 없습니다."
           else
             TODAY=$(date +'%Y-%m-%d')
-            git commit -m "chore(data): auto-update apt deals [${TODAY}]"
+            git commit -m "chore(data): auto-update apt deals and AI market report [${TODAY}]"
             git push
-            echo "최신 실거래 데이터가 성공적으로 GitHub에 푸시되었습니다."
+            echo "최신 실거래 데이터와 AI 리포트가 성공적으로 GitHub에 푸시되었습니다."
           fi
