@@ -71,44 +71,62 @@ def build_analyst_prompt(deal_date: str, metrics: dict) -> str:
 """
     return prompt.strip()
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=4),
-    retry=retry_if_exception_type((httpx.RequestError, httpx.HTTPStatusError)),
-    reraise=True
-)
-def call_gemini_api(prompt: str, api_key: str | None = None, model: str = "gemini-1.5-flash") -> str:
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-flash-latest"]
+
+def call_gemini_api(prompt: str, api_key: str | None = None, model: str = DEFAULT_GEMINI_MODEL) -> str:
     """Google Gemini API를 호출하여 프롬프트에 대한 응답 텍스트를 생성합니다."""
     key = api_key or os.getenv("GEMINI_API_KEY", "").strip()
     if not key:
         return "⚠️ `GEMINI_API_KEY`가 설정되지 않았습니다. `.env` 파일에 유효한 Gemini API 키를 등록해 주세요."
 
-    url = GEMINI_API_ENDPOINT.format(model=model)
-    params = {"key": key}
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"text": prompt}
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 1500
-        }
-    }
+    # 모델 후보군 리스트: 지정된 모델 우선, 실패 시 fallback 모델 순차 시도
+    models_to_try = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_error = ""
 
-    with httpx.Client(timeout=25.0) as client:
-        resp = client.post(url, params=params, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+    for target_model in models_to_try:
+        url = GEMINI_API_ENDPOINT.format(model=target_model)
+        params = {"key": key}
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt}
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.3,
+                "maxOutputTokens": 2048
+            }
+        }
 
         try:
-            return data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except (KeyError, IndexError) as e:
-            logger.error(f"Gemini API 응답 파싱 실패: {e}, raw: {data}")
-            return "⚠️ Gemini API 응답을 파싱하는 중 오류가 발생했습니다."
+            with httpx.Client(timeout=35.0) as client:
+                resp = client.post(url, params=params, json=payload)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    parts = data["candidates"][0]["content"]["parts"]
+                    text = "".join([p.get("text", "") for p in parts]).strip()
+                    if text:
+                        return text
+                elif resp.status_code in (404, 503):
+                    logger.warning(f"모델 {target_model} 호출 실패 ({resp.status_code}): 다음 후보 모델 시도")
+                    last_error = f"{target_model} ({resp.status_code}): {resp.text[:150]}"
+                    continue
+                else:
+                    resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            last_error = str(e)
+            if e.response.status_code in (404, 503):
+                continue
+            raise
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"모델 {target_model} 예외: {e}")
+            continue
+
+    return f"⚠️ Gemini AI 분석 생성 중 오류가 발생했습니다: {last_error}"
 
 def get_or_create_daily_analysis(
     deal_date: str,
@@ -116,7 +134,7 @@ def get_or_create_daily_analysis(
     db_path: str = DEFAULT_DB_PATH,
     api_key: str | None = None,
     force_refresh: bool = False,
-    model: str = "gemini-1.5-flash"
+    model: str = DEFAULT_GEMINI_MODEL
 ) -> tuple[dict, bool]:
     """
     특정 일자의 AI 분석 요약을 조회하거나 신규 생성합니다.
