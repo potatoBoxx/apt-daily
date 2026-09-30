@@ -13,8 +13,9 @@
 # 기획 및 설계 문서 (사용자 요청)
 docs/
 
-# 로컬 원장 데이터베이스 (배포용 경량 data/latest_deals.parquet만 Git으로 관리)
+# 로컬 원장 데이터베이스 (apt_deals.db는 버전 관리 허용, 저널 및 임시 db 파일 제외)
 data/*.db
+!data/apt_deals.db
 data/*.db-journal
 data/*.sqlite
 data/*.sqlite3
