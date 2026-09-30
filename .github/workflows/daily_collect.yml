@@ -29,17 +29,25 @@ jobs:
       - name: 프로젝트 의존성 설치
         run: uv sync
 
+      - name: API 키 연결 상태 사전 검증
+        run: |
+          if [ -z "${{ secrets.MOLIT_API_KEY }}" ]; then
+            echo "::error::GitHub Secrets에 MOLIT_API_KEY가 설정되지 않았습니다! 리포지토리의 Settings > Secrets and variables > Actions 에 MOLIT_API_KEY를 등록해 주세요."
+            exit 1
+          fi
+          echo "MOLIT_API_KEY 시크릿이 정상적으로 연결되어 있습니다."
+
       - name: 전국 아파트 실거래가 수집 실행
         env:
           MOLIT_API_KEY: ${{ secrets.MOLIT_API_KEY }}
         run: |
           uv run python -m src.collector --days 7
 
-      - name: 변경된 데이터 파일 Git Commit & Push
+      - name: 최신 Parquet 데이터 Git Commit & Push
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/apt_deals.db data/latest_deals.parquet
+          git add data/latest_deals.parquet
           
           if git diff --staged --quiet; then
             echo "새로 변경되거나 추가된 거래 데이터가 없습니다."
@@ -47,5 +55,5 @@ jobs:
             TODAY=$(date +'%Y-%m-%d')
             git commit -m "chore(data): auto-update apt deals [${TODAY}]"
             git push
-            echo "최신 데이터가 성공적으로 GitHub에 푸시되었습니다."
+            echo "최신 실거래 데이터가 성공적으로 GitHub에 푸시되었습니다."
           fi
