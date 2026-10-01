@@ -1,9 +1,16 @@
 import logging
 import os
+import sys
 from typing import Any
 import httpx
 from dotenv import load_dotenv
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 from src.storage import (
     get_daily_summary, save_daily_summary, export_ai_summaries_to_json,
