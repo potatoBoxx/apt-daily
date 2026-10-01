@@ -124,7 +124,14 @@ with col4:
 st.markdown("---")
 
 # 4. 🤖 AI 부동산 애널리스트 리포트 섹션
+# 환경변수(.env) 및 Streamlit Cloud Secrets (st.secrets) 모두 지원
 gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+if not gemini_key:
+    try:
+        if "GEMINI_API_KEY" in st.secrets:
+            gemini_key = str(st.secrets["GEMINI_API_KEY"]).strip()
+    except Exception:
+        pass
 
 col_rep_title, col_rep_btn = st.columns([3, 1])
 with col_rep_title:
@@ -139,26 +146,38 @@ with col_rep_btn:
 if not can_refresh:
     st.caption("ℹ️ 해당 일자의 AI 분석 재작성은 1회로 제한되어 있으며, 이미 재작성이 완료되었습니다.")
 
-should_refresh = (force_refresh or main_refresh) and can_refresh
+user_requested_refresh = (force_refresh or main_refresh) and can_refresh
 
-if not gemini_key:
-    st.warning("⚠️ `.env` 파일에 `GEMINI_API_KEY`가 설정되어 있지 않습니다. 키를 등록하시면 인공지능 애널리스트의 날카로운 일일 분석 리포트가 자동으로 생성됩니다.")
-    st.markdown("""
-    ```ini
-    # .env 파일에 아래 설정을 추가해 주세요
-    GEMINI_API_KEY=your_google_gemini_api_key_here
+if user_requested_refresh and not gemini_key:
+    st.error("⚠️ AI 분석을 새로 생성하려면 `GEMINI_API_KEY`가 필요합니다. Streamlit Cloud의 Settings > Secrets 또는 로컬 `.env`에 키를 등록해 주세요.")
+    should_refresh = False
+else:
+    should_refresh = user_requested_refresh
+
+with st.spinner("AI 부동산 애널리스트 리포트를 불러오는 중입니다..."):
+    analysis_data, is_cached = get_or_create_daily_analysis(
+        deal_date=selected_date,
+        parquet_path=parquet_path,
+        db_path=db_path,
+        api_key=gemini_key,
+        force_refresh=should_refresh
+    )
+
+summary_markdown = analysis_data.get("summary_markdown", "")
+has_error = is_error_summary(summary_markdown)
+
+if has_error and not gemini_key:
+    st.warning("⚠️ 아직 해당 일자의 AI 리포트가 생성되지 않았으며, `GEMINI_API_KEY`가 설정되어 있지 않습니다.")
+    st.info("""
+    **💡 안내**:
+    - 매일 아침 GitHub Actions가 당일 리포트를 자동 생성하여 저장소에 배포합니다.
+    - 웹에서 즉시 직접 생성을 원하시면 **Streamlit Cloud 설정(Settings > Secrets)** 또는 `.env`에 `GEMINI_API_KEY`를 등록해 주세요.
+    ```toml
+    # Streamlit Cloud: App Settings > Secrets에 아래와 같이 추가
+    GEMINI_API_KEY = "your_google_gemini_api_key_here"
     ```
     """)
 else:
-    with st.spinner("AI 부동산 애널리스트가 당일 시장 데이터를 심층 분석 중입니다..."):
-        analysis_data, is_cached = get_or_create_daily_analysis(
-            deal_date=selected_date,
-            parquet_path=parquet_path,
-            db_path=db_path,
-            api_key=gemini_key,
-            force_refresh=should_refresh
-        )
-
     # 뱃지 및 생성 정보 표시
     badge_label = "💾 SQLite DB 캐시에서 불러옴 (API 호출 0회)"
     if not is_cached:
@@ -175,7 +194,7 @@ else:
     # 마크다운 박스 렌더링
     st.markdown(f"""
     <div class="report-box">
-    {analysis_data.get('summary_markdown', '분석 내용이 없습니다.')}
+    {summary_markdown}
     </div>
     """, unsafe_allow_html=True)
 
